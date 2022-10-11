@@ -207,7 +207,6 @@ static struct station *get_station_by_addr(struct wmediumd *ctx, u8 *addr)
 
 void detect_mediums(struct wmediumd *ctx, struct station *src, struct station *dest) {
     int medium_id;
-	
     if (!ctx->enable_medium_detection){
         return;
     }
@@ -238,13 +237,16 @@ void detect_mediums(struct wmediumd *ctx, struct station *src, struct station *d
 }
 
 /*
- * Report transmit status to the kernel.
+ * Send a data frame to the kernel for reception at a specific radio.
  */
-static int send_tx_info_frame_nl(struct wmediumd *ctx, struct frame *frame)
+int send_cloned_frame_msg(struct wmediumd *ctx, struct station *dst,
+			  u8 *data, int data_len, int rate_idx, int signal,
+			  int freq)
 {
-	struct nl_sock *sock = ctx->sock;
 	struct nl_msg *msg;
+	struct nl_sock *sock = ctx->sock;
 	int ret;
+
 	msg = nlmsg_alloc();
 	if (!msg) {
 		w_logf(ctx, LOG_ERR, "Error allocating new message MSG!\n");
@@ -252,26 +254,26 @@ static int send_tx_info_frame_nl(struct wmediumd *ctx, struct frame *frame)
 	}
 
 	if (genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, ctx->family_id,
-			0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME,
+			0, NLM_F_REQUEST, HWSIM_CMD_FRAME,
 			VERSION_NR) == NULL) {
 		w_logf(ctx, LOG_ERR, "%s: genlmsg_put failed\n", __func__);
 		ret = -1;
 		goto out;
 	}
 
-	if (nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN,
-		    frame->sender->hwaddr) ||
-	    nla_put_u32(msg, HWSIM_ATTR_FLAGS, frame->flags) ||
-	    nla_put_u32(msg, HWSIM_ATTR_SIGNAL, frame->signal) ||
-	    nla_put(msg, HWSIM_ATTR_TX_INFO,
-		    frame->tx_rates_count * sizeof(struct hwsim_tx_rate),
-		    frame->tx_rates) ||
-	    nla_put_u64(msg, HWSIM_ATTR_COOKIE, frame->cookie)) {
+	if (nla_put(msg, HWSIM_ATTR_ADDR_RECEIVER, ETH_ALEN,
+		    dst->hwaddr) ||
+	    nla_put(msg, HWSIM_ATTR_FRAME, data_len, data) ||
+	    nla_put_u32(msg, HWSIM_ATTR_RX_RATE, rate_idx) ||
+	    nla_put_u32(msg, HWSIM_ATTR_FREQ, freq) ||
+	    nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal)) {
 			w_logf(ctx, LOG_ERR, "%s: Failed to fill a payload\n", __func__);
 			ret = -1;
 			goto out;
 	}
 
+	w_logf(ctx, LOG_DEBUG, "cloned msg dest " MAC_FMT " (radio: " MAC_FMT ") len %d\n",
+		   MAC_ARGS(dst->addr), MAC_ARGS(dst->hwaddr), data_len);
 	ret = nl_send_auto_complete(sock, msg);
 	if (ret < 0) {
 		w_logf(ctx, LOG_ERR, "%s: nl_send_auto failed\n", __func__);
@@ -279,6 +281,7 @@ static int send_tx_info_frame_nl(struct wmediumd *ctx, struct frame *frame)
 		goto out;
 	}
 	ret = 0;
+
 out:
 	nlmsg_free(msg);
 	return ret;
@@ -296,150 +299,67 @@ int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
 	return NL_SKIP;
 }
 
-mystruct_nlmsg serialize_message_tosend(u8 *hwaddr, unsigned int data_len, unsigned int flags, unsigned int tx_rates_len, 
-				struct hwsim_tx_rate *tx_rates, u64 cookie, u32 freq, u8 *src, u8 *data)
-{
-	mystruct_nlmsg message;
-	
-	memcpy(message.hwaddr_t, hwaddr, ETH_ALEN);
-	message.data_len_t = data_len;
-	message.flags_t = flags;
-	message.tx_rates_len_t = tx_rates_len;
-	memcpy(message.tx_rates_t, tx_rates, min(tx_rates_len, sizeof(message.tx_rates_t)));
-	message.cookie_t = cookie;
-	message.freq_t = freq;
-	memcpy(message.src_t, src, ETH_ALEN);
-	memcpy(message.data_t, data, data_len);
-	
-	return message;
-}
-
-int send_to_global(int sock_w, mystruct_nlmsg *tosend)
-{
-	//Send data to global wmediumd
-	if(send(sock_w, tosend, sizeof(mystruct_nlmsg), 0)< 0)
-	{
-		puts("TCP send failed");
-		return 1;
-	}
-		
-	return 0;
-}
-
-int recv_from_global(int sock_w, struct wmediumd *ctx, struct frame *frame)
-{
-	mystruct_frame server_reply;
-	mystruct_frame *torecv;
-	torecv = &server_reply;
-	
-	//Receive a reply from the server
-	if(recv(sock_w, torecv, sizeof(mystruct_frame), 0)< 0)
-	{
-		puts("TCP recv failed");
-		return 1;
-	}
-	else
-	{	
-		frame->cookie = server_reply.cookie_tosend;
-		frame->flags = server_reply.flags_tosend;
-		frame->tx_rates_count = server_reply.tx_rates_count_tosend;
-		memcpy(frame->tx_rates, server_reply.tx_rates_tosend, sizeof(server_reply.tx_rates_tosend));
-		frame->signal = server_reply.signal_tosend;
-		
-		send_tx_info_frame_nl(ctx, frame);
-		free(frame);
-	}
-	
-	return 0;
-}
-
 /*
  * Handle events from the kernel.  Process CMD_FRAME events and queue them
  * for later delivery with the scheduler.
  */
-static int process_messages_cb(struct nl_msg *msg, void *arg)
+
+void *rx_cmd_frame(void *unused)
 {
-	struct wmediumd *ctx = arg;
-	struct nlattr *attrs[HWSIM_ATTR_MAX+1];
-	/* netlink header */
-	struct nlmsghdr *nlh = nlmsg_hdr(msg);
-	/* generic netlink header*/
-	struct genlmsghdr *gnlh = nlmsg_data(nlh);
-	
-	mystruct_nlmsg message;
-	mystruct_nlmsg* tosend;
-    	tosend = &message;
-	
-	struct station *sender;
-	struct frame *frame;
-	struct ieee80211_hdr *hdr;
-	u8 *src;
-	int sock_w = socket_to_global;
+	mystruct_tobroadcast broad_mex;
+	struct wmediumd *ctx = ctx_to_pass;
+	struct station *station_udp;
+	int port = 8080;
+	int sockfd_udp;
+	struct sockaddr_in server_addr_udp, client_addr_udp;
+	socklen_t addr_size_udp;
+	int n_udp;
 
-	if (gnlh->cmd == HWSIM_CMD_FRAME) {
-		
-		pthread_rwlock_rdlock(&snr_lock);
-		/* we get the attributes*/
-		genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL);
-		
-		if (attrs[HWSIM_ATTR_ADDR_TRANSMITTER]) {
-			u8 *hwaddr = (u8 *)nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]); 
-			unsigned int data_len =
-				nla_len(attrs[HWSIM_ATTR_FRAME]);
-			char *data = (char *)nla_data(attrs[HWSIM_ATTR_FRAME]); 
-			unsigned int flags =
-				nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
-			unsigned int tx_rates_len =
-				nla_len(attrs[HWSIM_ATTR_TX_INFO]);
-			struct hwsim_tx_rate *tx_rates =
-				(struct hwsim_tx_rate *)
-				nla_data(attrs[HWSIM_ATTR_TX_INFO]);
-			u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
-			u32 freq; 
-			freq = attrs[HWSIM_ATTR_FREQ] ?
-					nla_get_u32(attrs[HWSIM_ATTR_FREQ]) : 2412;
-
-			hdr = (struct ieee80211_hdr *)data;
-
-			if (data_len < 6 + 6 + 4)
-				goto out;
-			frame = malloc(sizeof(*frame) + data_len);
-			
-			src = hdr->addr2; 
-			sender = get_station_by_addr(ctx, src);
-			if (!sender) {
-				w_flogf(ctx, LOG_ERR, stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
-				goto out;
-			}
-			memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
-			
-			if (!frame)
-				goto out;
-				
-			memcpy(frame->data, data, data_len);
-			frame->data_len = data_len;
-			frame->flags = flags;
-			frame->cookie = cookie;
-			frame->freq = freq;
-			frame->sender = sender;
-			sender->freq = freq;
-			frame->tx_rates_count =
-				tx_rates_len / sizeof(struct hwsim_tx_rate);
-			memcpy(frame->tx_rates, tx_rates,
-			      	min(tx_rates_len, sizeof(frame->tx_rates)));
-				
-			message = serialize_message_tosend(hwaddr, data_len, flags, tx_rates_len, tx_rates, cookie, freq, src, frame->data);
-			
-			send_to_global(sock_w, tosend);
-			recv_from_global(sock_w, ctx, frame);
-			
-		}
-out:
-		pthread_rwlock_unlock(&snr_lock);
-		return 0;
-
+	sockfd_udp = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockfd_udp < 0){
+	perror("UDP socket error");
+	exit(1);
 	}
-	return 0;
+
+	memset(&server_addr_udp, '\0', sizeof(server_addr_udp));
+	server_addr_udp.sin_family = AF_INET;
+	server_addr_udp.sin_port = htons(port);
+	server_addr_udp.sin_addr.s_addr = INADDR_ANY;
+	
+	int opt_reuse = 1;
+  	setsockopt(sockfd_udp, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+  
+	n_udp = bind(sockfd_udp, (struct sockaddr*)&server_addr_udp, sizeof(server_addr_udp));
+	if (n_udp < 0) {
+	perror("UDP bind error");
+	exit(1);
+	}
+
+	//Receive from UDP broadcast
+	while(1)
+	{
+		addr_size_udp = sizeof(client_addr_udp);
+		if(recvfrom(sockfd_udp, (mystruct_tobroadcast *)&broad_mex, sizeof(mystruct_tobroadcast), 0, (struct sockaddr*)&client_addr_udp, &addr_size_udp) < 0)
+		{
+			printf("recv failed");
+		}
+		else
+		{	
+			list_for_each_entry(station_udp, &ctx->stations, list) 
+			{
+				if (memcmp(broad_mex.hwaddr, station_udp->hwaddr, ETH_ALEN) == 0)
+				{
+					send_cloned_frame_msg(ctx, station_udp,
+							      broad_mex.data_tobroadcast,
+							      broad_mex.data_len_tobroadcast,
+							      broad_mex.rate_idx_tobroadcast, 
+							      broad_mex.signal_tobroadcast,
+							      broad_mex.freq_tobroadcast);
+				}
+			}
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -516,7 +436,6 @@ static int init_netlink(struct wmediumd *ctx)
 		return -1;
 	}
 
-	nl_cb_set(ctx->cb, NL_CB_MSG_IN, NL_CB_CUSTOM, process_messages_cb, ctx);
 	nl_cb_err(ctx->cb, NL_CB_CUSTOM, nl_err_cb, ctx);
 
 	return 0;
@@ -567,11 +486,12 @@ int main(int argc, char *argv[])
 	char *config_file = NULL;
 	char *per_file = NULL;
 	int opt;	
-	int sock_tcp = 0, client_fd;
+	pthread_t thread_n;
 	struct sockaddr_in serv_addr;
 	setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
 
 	if (argc == 1) {
+		fprintf(stderr, "This program needs arguments....\n\n");
 		print_help(EXIT_FAILURE);
 	}
 
@@ -633,16 +553,19 @@ int main(int argc, char *argv[])
 
 	if (full_dynamic) {
 		if (config_file) {
+			printf("%s: cannot use dynamic complex mode with config file\n", argv[0]);
 			print_help(EXIT_FAILURE);
 		}
 
 		if (!start_server) {
+			printf("%s: dynamic complex mode requires the server option\n", argv[0]);
 			print_help(EXIT_FAILURE);
 		}
 
 		w_logf(&ctx, LOG_NOTICE, "Using dynamic complex mode instead of config file\n");
 	} else {
 		if (!config_file) {
+			printf("%s: config file must be supplied\n", argv[0]);
 			print_help(EXIT_FAILURE);
 		}
 
@@ -675,35 +598,15 @@ int main(int argc, char *argv[])
 	if (send_register_msg(&ctx) == 0) {
 		w_logf(&ctx, LOG_NOTICE, "REGISTER SENT!\n");
 	}
+	fprintf(stdout, "Start wserver\n");
 	if (start_server == true)
 		start_wserver(&ctx);
 		
 	ctx_to_pass = &ctx;
 	
 	sleep(5);
-
-	/*Socket client opens*/
-	if ((sock_tcp = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		return -1;
-	}
 	
-	socket_to_global = sock_tcp;
-
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(8090);
-
-	// Convert IPv4 and IPv6 addresses from text to binary
-	// form
-	if (inet_pton(AF_INET, "192.168.236.91", &serv_addr.sin_addr)
-		<= 0) {
-		return -1;
-	}
-	if ((client_fd
-		= connect(sock_tcp, (struct sockaddr*)&serv_addr,
-				sizeof(serv_addr)))
-		< 0) {
-		return -1;
-	}
+	pthread_create(&thread_n, NULL, rx_cmd_frame, NULL);
 	
 	sleep(5);
 	
@@ -717,7 +620,8 @@ int main(int argc, char *argv[])
 	free(ctx.cb);
 	free(ctx.intf);
 	free(ctx.per_matrix);
-	close(client_fd);
+	pthread_join(thread_n, NULL);
+	pthread_exit(NULL);
 	
 	return EXIT_SUCCESS;
 }
